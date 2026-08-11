@@ -1,0 +1,1057 @@
+---
+title: "thesis"
+author: "Milou Kleijn"
+date: "`13/08/26`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Packages 
+```{r}
+library(readr)
+library(tidyverse)
+library(pROC)
+library(randomForest)
+library(gbm3)
+library(caret)
+library(writexl)
+library(knitr)
+library(extrafont)
+library(effectsize)
+```
+
+# Dataset 
+```{r}
+ESS5 <- read_csv("ESS5_cleaned_allcountries_675.csv")
+```
+
+# Preperation
+```{r}
+# Filter Germany
+ESS5.DE <- ESS5 %>% 
+  filter(cntry == 'DE')
+
+# Filter out minors under 18 and missings
+ESS5.DE.filt <- ESS5.DE %>%
+  filter(agea >= 18) %>% 
+  filter(agea != 999999) %>% 
+  filter(emplrel != 666666)
+
+# Create binary dependent variable
+ESS5.DE.STEM <- ESS5.DE.filt %>%
+  mutate(stem = ifelse(
+    (iscoco >= 2110 & iscoco <= 2114) |     # physicists, chemists etc.
+      (iscoco >= 2120 & iscoco <= 2122) |   # mathematicians, statisticians
+      (iscoco >= 2130 & iscoco <= 2139) |   # computing professionals
+      (iscoco >= 2140 & iscoco <= 2146) |   # architects, engineers
+      (iscoco >= 3110 & iscoco <= 3116) |   # physical/engineering technicians
+      (iscoco >= 3121 & iscoco <= 3123),    # computer assistants/operators
+    1, 0))
+
+
+```
+
+# Variable Selection (Decision 0)
+```{r}
+# Select only the variables I need
+ESS5.DE.final <- ESS5.DE.STEM %>%
+  select(idno, agea, emplrel, rsnlvem, yrspdwka, uemp3m, impdiff, atncrse, 
+         netuse, sclmeet, sclact, health, hlthhmp, actvgrs, 
+         edulvlb, ipeqopt, dscrgrp, dscrrce, dscretn, 
+         wmcpwrk, mnrgtjb, dscrgnd, dscrage, imprich, ipfrule, 
+         jbspv, stem)
+
+```
+
+# NA's
+```{r}
+# Check and remove missings (999999)
+colSums(sapply(ESS5.DE.final, function(x) x == 999999), na.rm = TRUE)
+ESS5.DE.final <- ESS5.DE.final[!rowSums(ESS5.DE.final == 999999) > 0, ]
+ESS5.DE.final <- ESS5.DE.final %>%
+  filter(impdiff != 8) %>%
+  filter(ipeqopt != 8) %>% 
+  filter(imprich != 8) %>% 
+  filter(ipfrule != 8)
+
+nrow(ESS5.DE.final)
+```
+
+## Recoding variables 
+```{r}
+# Recode binary variables to 0/1 instead of 1/2
+ESS5.DE.final.rec <- ESS5.DE.final %>% 
+  mutate(
+    uemp3m = ifelse(uemp3m == 1, 1, 0), #If the value is 1, keep it as 1, 
+    atncrse = ifelse(atncrse == 1, 1, 0), #anything else, make it 0 
+    jbspv = ifelse(jbspv == 1, 1, 0), 
+    dscrgrp = ifelse(dscrgrp == 1, 1, 0)
+    ) %>% 
+# Recode education variable into smaller groups based on ISCED 2011 categorization
+  mutate(edulvlb = case_when(
+    edulvlb == 5555 ~ "Other",
+    edulvlb < 100 ~ "ISCED 0 - Less than primary",
+    edulvlb < 200 ~ "ISCED 1 - Primary",
+    edulvlb < 300 ~ "ISCED 2 - Lower secondary",
+    edulvlb < 400 ~ "ISCED 3 - Upper secondary",
+    edulvlb < 500 ~ "ISCED 4 - Post-secondary non-tertiary",
+    edulvlb < 600 ~ "ISCED 5 - Short-cycle tertiary",
+    edulvlb < 700 ~ "ISCED 6 - Bachelor or equivalent",
+    edulvlb < 800 ~ "ISCED 7 - Master or equivalent",
+    edulvlb < 900 ~ "ISCED 8 - Doctoral or equivalent"
+  )) %>% 
+   filter(edulvlb != "Other") %>% #Not a category in ISCED
+  # Recode binary and nominal variables into factors
+  mutate(across(c(emplrel, rsnlvem, uemp3m, atncrse, dscrgrp, dscrrce, dscretn,
+                  dscrgnd, dscrage, hlthhmp, jbspv, stem, edulvlb), as.factor)
+  ) 
+```
+
+# Final sample
+```{r}
+# Final sample size
+nrow(ESS5.DE.final.rec)
+table(ESS5.DE.final.rec$stem)
+prop.table(table(ESS5.DE.final.rec$stem))
+```
+
+## Descriptives 
+
+```{r}
+mean(ESS5.DE.final.rec$agea)
+sd(ESS5.DE.final.rec$agea)
+
+as.data.frame(table(ESS5.DE.final.rec$edulvlb))
+as.data.frame(table(ESS5.DE.final.rec$emplrel))
+```
+
+## Training set + Test set
+```{r}
+set.seed(1512)
+
+train_index <- sample(1:nrow(ESS5.DE.final.rec), 0.8 * nrow(ESS5.DE.final.rec))
+
+train_df <- ESS5.DE.final.rec[train_index, ]
+test_df <- ESS5.DE.final.rec[-train_index, ]
+
+# Check STEM distribution in both sets
+prop.table(table(train_df$stem))
+prop.table(table(test_df$stem))
+```
+
+### Gender for descriptive analysis (so not added as predictor)
+```{r}
+gender_lookup <- ESS5.DE.STEM %>% select(idno, gndr)
+
+test_df_with_gender <- test_df %>%
+  left_join(gender_lookup, by = "idno")
+
+prop.table(table(test_df_with_gender$gndr))
+
+```
+
+## Bootstrap oversampling
+```{r}
+set.seed(1512)
+
+stem_cases <- train_df[train_df$stem == 1, ]
+non_stem_cases <- train_df[train_df$stem == 0, ]
+
+stem_oversampled <- stem_cases[sample(nrow(stem_cases), 
+                                      size = nrow(non_stem_cases), 
+                                      replace = TRUE), ]
+
+train_df_balanced <- rbind(non_stem_cases, stem_oversampled)
+prop.table(table(train_df_balanced$stem))
+```
+
+# Age operationalization (Decision 1)
+```{r}
+
+operationalize_age <- function(df, type, cutoff = NULL) {
+  if (type == "continuous") {
+    return(df)  # agea already numeric, no change needed
+  } else if (type == "binary") {
+    df <- df %>%
+      mutate(agea = ifelse(agea >= cutoff, 1, 0))
+    return(df)
+  }
+}
+```
+
+# Algorithms (Decision 2)
+
+### Algorithm 1: Multinomial logisitc regression
+```{r}
+
+fit_glm <- function(train_df, test_df) { 
+
+  #Model
+  glm_model <- glm(stem ~ . - idno, data = train_df, family = binomial)
+  
+  #Predictions
+  pred_prob_train <- predict(glm_model, newdata = train_df, type = "response")
+  pred_prob <- predict(glm_model, newdata = test_df, type = "response")
+  
+  y_train <- as.numeric(as.character(train_df$stem))
+  y_test <- as.numeric(as.character(test_df$stem))
+  #AUC
+  auc_train <- roc(y_train, pred_prob_train) %>% auc()
+  auc_test <- roc(y_test, pred_prob) %>% auc()
+  
+  #Output
+  evaluation <- tibble(auc_train = auc_train, 
+                       auc_test = auc_test)
+  
+  results <- list(evaluation = evaluation,
+                  predictions_train = pred_prob_train, 
+                  predictions_test = pred_prob,
+                  model = glm_model
+                   )
+
+  return(results)
+  }
+```
+
+### Algorithm 2: Bagging
+```{r}
+
+fit_bagging <- function(train_df, test_df) { 
+  set.seed(1512)
+  
+  p <- ncol(train_df) - 1
+  #Default no. trees = 500
+  bag_model <- randomForest(stem ~ . - idno, data = train_df,
+                            mtry = p,
+                            ntree = 500, importance = TRUE)
+  #Out-of-bag error estimation
+  OOB_err_est <- bag_model$err.rate[bag_model$ntree, "OOB"]
+  
+  #Predictions
+  pred_model <- predict(bag_model, newdata = test_df)
+  pred_prob_train <- predict(bag_model, newdata = train_df, type = "prob") [,2]
+  pred_prob <- predict(bag_model, newdata = test_df, type = "prob")[,2]
+  
+  y_train <- as.numeric(as.character(train_df$stem))
+  y_test <- as.numeric(as.character(test_df$stem))
+  
+  #AUC
+  auc_train <- roc(y_train, pred_prob_train) %>% auc()
+  auc_test <- roc(y_test, pred_prob) %>% auc()
+  
+  #Output
+  evaluation <- tibble(OOB_error = OOB_err_est,
+                       auc_train = auc_train,
+                       auc_test = auc_test)
+  
+  results <- list(evaluation = evaluation,
+                  predictions_train = pred_prob_train, 
+                  predictions_test = pred_prob,
+                  model = bag_model
+                  )
+  
+  return(results)
+  }
+```
+
+### Algorithm 3: Boosting
+```{r}
+
+fit_boosting <- function(train_df, test_df) { 
+  set.seed(1512)
+  
+  train_df <- train_df %>% mutate(stem = as.numeric(as.character(stem)))
+  test_df <- test_df %>% mutate(stem = as.numeric(as.character(stem)))
+  
+  #Model 
+  boost_model <- gbm(stem ~. - idno, data = train_df, 
+                    distribution = "bernoulli", 
+                    n.trees = 5000, 
+                    interaction.depth = 4)
+  
+  #Predictions
+  pred_prob_train <- predict(boost_model, newdata = train_df, n.trees = 5000, 
+                             type = "response")
+  pred_prob <- predict(boost_model, newdata = test_df, n.trees = 5000, 
+                       type = "response")
+  
+  y_train <- as.numeric(as.character(train_df$stem))
+  y_test <- as.numeric(as.character(test_df$stem))
+  
+  #AUC
+  auc_train <- roc(y_train, pred_prob_train) %>% auc()
+  auc_test <- roc(y_test, pred_prob) %>% auc()
+  
+  #Output
+  evaluation <- tibble(auc_train = auc_train, 
+                       auc_test = auc_test)
+  
+  results <- list(evaluation = evaluation,
+                  predictions_train = pred_prob_train, 
+                  predictions_test = pred_prob,
+                  model = boost_model)
+  
+  return(results)
+  }
+```
+
+# Threshols (Decision 3)
+
+```{r}
+
+apply_threshold <- function(pred_prob, threshold) {
+  as.factor(ifelse(pred_prob >= threshold, 1, 0))
+
+  }
+```
+
+# Combined function for all decisions
+
+```{r}
+
+run_models <- function(train_df, test_df, age_type, cutoff = NULL) {
+  
+  #Apply age operationalization
+  train <- operationalize_age(train_df, age_type, cutoff)
+  test <- operationalize_age(test_df, age_type, cutoff)
+  
+  #Run all three algorithms
+  glm_results <- fit_glm(train, test)
+  bag_results <- fit_bagging(train, test)
+  boost_results <- fit_boosting(train, test)
+  
+  #Apply all three thresholds to test predictions
+  thresholds <- c(0.3, 0.5, 0.7)
+  
+  classifications <- lapply(thresholds, function(thresh) {
+    list(
+      threshold = thresh,
+      glm = apply_threshold(glm_results$predictions_test, thresh),
+      bagging = apply_threshold(bag_results$predictions_test, thresh),
+      boosting = apply_threshold(boost_results$predictions_test, thresh)
+    )
+  })
+  
+  return(list(
+    glm = glm_results,
+    bagging = bag_results,
+    boosting = boost_results,
+    classifications = classifications
+  ))
+}
+```
+
+# Results per age operationalization (50 used for the rest of the analysis)
+
+```{r}
+results_continuous <- run_models(train_df_balanced, test_df, "continuous")
+results_age40 <- run_models(train_df_balanced, test_df, "binary", cutoff = 40)
+results_age45 <- run_models(train_df_balanced, test_df, "binary", cutoff = 45)
+results_age50 <- run_models(train_df_balanced, test_df, "binary", cutoff = 50)
+results_age55 <- run_models(train_df_balanced, test_df, "binary", cutoff = 55)
+```
+
+# Models
+
+```{r}
+# Baseline
+bin50_glm_05 <- apply_threshold(results_age50$glm$predictions_test, 0.5)
+# Continuous age
+cont_glm_03 <- apply_threshold(results_continuous$glm$predictions_test, 0.3)
+cont_glm_05 <- apply_threshold(results_continuous$glm$predictions_test, 0.5)
+cont_glm_07 <- apply_threshold(results_continuous$glm$predictions_test, 0.7)
+
+cont_bag_03 <- apply_threshold(results_continuous$bagging$predictions_test, 0.3)
+cont_bag_05 <- apply_threshold(results_continuous$bagging$predictions_test, 0.5)
+cont_bag_07 <- apply_threshold(results_continuous$bagging$predictions_test, 0.7)
+
+cont_boost_03 <- apply_threshold(results_continuous$boosting$predictions_test, 0.3)
+cont_boost_05 <- apply_threshold(results_continuous$boosting$predictions_test, 0.5)
+cont_boost_07 <- apply_threshold(results_continuous$boosting$predictions_test, 0.7)
+
+# Binary age at 50
+bin50_glm_03 <- apply_threshold(results_age50$glm$predictions_test, 0.3)
+bin50_glm_07 <- apply_threshold(results_age50$glm$predictions_test, 0.7)
+
+bin50_bag_03 <- apply_threshold(results_age50$bagging$predictions_test, 0.3)
+bin50_bag_05 <- apply_threshold(results_age50$bagging$predictions_test, 0.5)
+bin50_bag_07 <- apply_threshold(results_age50$bagging$predictions_test, 0.7)
+
+bin50_boost_03 <- apply_threshold(results_age50$boosting$predictions_test, 0.3)
+bin50_boost_05 <- apply_threshold(results_age50$boosting$predictions_test, 0.5)
+bin50_boost_07 <- apply_threshold(results_age50$boosting$predictions_test, 0.7)
+
+```
+
+## Evaluate models function
+
+```{r}
+
+evaluate_model <- function(model_classifications, test_df, pred_prob) {
+  
+  true_labels <- as.factor(as.numeric(as.character(test_df$stem)))
+  cm <- confusionMatrix(model_classifications, true_labels, positive = "1")
+  auc <- roc(as.numeric(as.character(test_df$stem)), pred_prob) %>% auc()
+  
+  return(tibble(
+    auc = as.numeric(auc),
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"]
+  ))
+}
+```
+
+# Evaluate models
+
+```{r}
+# Baseline: Binary age 50 - GLM - threshold 0.5
+eval_bin50_glm_05 <- evaluate_model(bin50_glm_05, test_df,
+                                    results_age50$glm$predictions_test)
+
+# Continuous age - GLM
+eval_cont_glm_03 <- evaluate_model(cont_glm_03, test_df, 
+                                   results_continuous$glm$predictions_test)
+eval_cont_glm_05 <- evaluate_model(cont_glm_05, test_df, 
+                                   results_continuous$glm$predictions_test)
+eval_cont_glm_07 <- evaluate_model(cont_glm_07, test_df, 
+                                   results_continuous$glm$predictions_test)
+
+# Continuous age - Bagging
+eval_cont_bag_03 <- evaluate_model(cont_bag_03, test_df, 
+                                   results_continuous$bagging$predictions_test)
+eval_cont_bag_05 <- evaluate_model(cont_bag_05, test_df, 
+                                   results_continuous$bagging$predictions_test)
+eval_cont_bag_07 <- evaluate_model(cont_bag_07, test_df, 
+                                   results_continuous$bagging$predictions_test)
+
+# Continuous age - Boosting
+eval_cont_boost_03 <- evaluate_model(cont_boost_03, test_df, 
+                                     results_continuous$boosting$predictions_test)
+eval_cont_boost_05 <- evaluate_model(cont_boost_05, test_df, 
+                                     results_continuous$boosting$predictions_test)
+eval_cont_boost_07 <- evaluate_model(cont_boost_07, test_df, 
+                                     results_continuous$boosting$predictions_test)
+
+# Binary age 50 - GLM
+eval_bin50_glm_03 <- evaluate_model(bin50_glm_03, test_df, 
+                                    results_age50$glm$predictions_test)
+eval_bin50_glm_07 <- evaluate_model(bin50_glm_07, test_df, 
+                                    results_age50$glm$predictions_test)
+
+# Binary age 50 - Bagging
+eval_bin50_bag_03 <- evaluate_model(bin50_bag_03, test_df, 
+                                    results_age50$bagging$predictions_test)
+eval_bin50_bag_05 <- evaluate_model(bin50_bag_05, test_df, 
+                                    results_age50$bagging$predictions_test)
+eval_bin50_bag_07 <- evaluate_model(bin50_bag_07, test_df, 
+                                    results_age50$bagging$predictions_test)
+
+# Binary age 50 - Boosting
+eval_bin50_boost_03 <- evaluate_model(bin50_boost_03, test_df, 
+                                      results_age50$boosting$predictions_test)
+eval_bin50_boost_05 <- evaluate_model(bin50_boost_05, test_df, 
+                                      results_age50$boosting$predictions_test)
+eval_bin50_boost_07 <- evaluate_model(bin50_boost_07, test_df, 
+                                      results_age50$boosting$predictions_test)
+
+```
+
+# Contradiction points
+
+```{r}
+
+find_contradictions <- function(p1, p2, T) {
+  P <- data.frame(p1, p2)
+  
+  # Find cases where classification differs
+  indices <- which((p1 < T & p2 > T) | (p1 > T & p2 < T))
+  P_inbetween <- P[indices, ]
+  P_n <- P_inbetween %>% nrow()
+  P_per <- round(100 * P_n / length(p1), 1)
+  
+  found <- c("all" = length(p1), 
+             "n_contradictions" = P_n, 
+             "perc_contradictions" = P_per)
+  
+  outcome <- list(found, P_inbetween, indices)
+  return(outcome)
+}
+
+```
+
+### Contradiction points vs baseline
+
+```{r}
+# Baseline probabilities
+baseline_prob <- results_age50$glm$predictions_test
+
+# Continuous age - GLM
+cp_cont_glm_03 <- find_contradictions(baseline_prob, results_continuous$glm$predictions_test, 0.3)
+cp_cont_glm_05 <- find_contradictions(baseline_prob, results_continuous$glm$predictions_test, 0.5)
+cp_cont_glm_07 <- find_contradictions(baseline_prob, results_continuous$glm$predictions_test, 0.7)
+
+# Continuous age - Bagging
+cp_cont_bag_03 <- find_contradictions(baseline_prob, results_continuous$bagging$predictions_test, 0.3)
+cp_cont_bag_05 <- find_contradictions(baseline_prob, results_continuous$bagging$predictions_test, 0.5)
+cp_cont_bag_07 <- find_contradictions(baseline_prob, results_continuous$bagging$predictions_test, 0.7)
+
+# Continuous age - Boosting
+cp_cont_boost_03 <- find_contradictions(baseline_prob, results_continuous$boosting$predictions_test, 0.3)
+cp_cont_boost_05 <- find_contradictions(baseline_prob, results_continuous$boosting$predictions_test, 0.5)
+cp_cont_boost_07 <- find_contradictions(baseline_prob, results_continuous$boosting$predictions_test, 0.7)
+
+# Binary age 50 - GLM
+cp_bin50_glm_03 <- find_contradictions(baseline_prob, results_age50$glm$predictions_test, 0.3)
+cp_bin50_glm_07 <- find_contradictions(baseline_prob, results_age50$glm$predictions_test, 0.7)
+
+# Binary age 50 - Bagging
+cp_bin50_bag_03 <- find_contradictions(baseline_prob, results_age50$bagging$predictions_test, 0.3)
+cp_bin50_bag_05 <- find_contradictions(baseline_prob, results_age50$bagging$predictions_test, 0.5)
+cp_bin50_bag_07 <- find_contradictions(baseline_prob, results_age50$bagging$predictions_test, 0.7)
+
+# Binary age 50 - Boosting
+cp_bin50_boost_03 <- find_contradictions(baseline_prob, results_age50$boosting$predictions_test, 0.3)
+cp_bin50_boost_05 <- find_contradictions(baseline_prob, results_age50$boosting$predictions_test, 0.5)
+cp_bin50_boost_07 <- find_contradictions(baseline_prob, results_age50$boosting$predictions_test, 0.7)
+
+```
+
+# Combined table for evaluation
+
+```{r}
+
+results_table <- rbind(
+  # Baseline
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.5,
+         auc = eval_bin50_glm_05$auc,
+         sensitivity = eval_bin50_glm_05$sensitivity,
+         specificity = eval_bin50_glm_05$specificity,
+         n_contradictions = 0, perc_contradictions = 0),
+  
+  # Continuous age - GLM
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.3,
+         auc = eval_cont_glm_03$auc,
+         sensitivity = eval_cont_glm_03$sensitivity,
+         specificity = eval_cont_glm_03$specificity,
+         n_contradictions = cp_cont_glm_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_glm_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.5,
+         auc = eval_cont_glm_05$auc,
+         sensitivity = eval_cont_glm_05$sensitivity,
+         specificity = eval_cont_glm_05$specificity,
+         n_contradictions = cp_cont_glm_05[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_glm_05[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.7,
+         auc = eval_cont_glm_07$auc,
+         sensitivity = eval_cont_glm_07$sensitivity,
+         specificity = eval_cont_glm_07$specificity,
+         n_contradictions = cp_cont_glm_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_glm_07[[1]]["perc_contradictions"]),
+  
+  # Continuous age - Bagging
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.3,
+         auc = eval_cont_bag_03$auc,
+         sensitivity = eval_cont_bag_03$sensitivity,
+         specificity = eval_cont_bag_03$specificity,
+         n_contradictions = cp_cont_bag_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_bag_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.5,
+         auc = eval_cont_bag_05$auc,
+         sensitivity = eval_cont_bag_05$sensitivity,
+         specificity = eval_cont_bag_05$specificity,
+         n_contradictions = cp_cont_bag_05[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_bag_05[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.7,
+         auc = eval_cont_bag_07$auc,
+         sensitivity = eval_cont_bag_07$sensitivity,
+         specificity = eval_cont_bag_07$specificity,
+         n_contradictions = cp_cont_bag_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_bag_07[[1]]["perc_contradictions"]),
+  
+  # Continuous age - Boosting
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.3,
+         auc = eval_cont_boost_03$auc,
+         sensitivity = eval_cont_boost_03$sensitivity,
+         specificity = eval_cont_boost_03$specificity,
+         n_contradictions = cp_cont_boost_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_boost_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.5,
+         auc = eval_cont_boost_05$auc,
+         sensitivity = eval_cont_boost_05$sensitivity,
+         specificity = eval_cont_boost_05$specificity,
+         n_contradictions = cp_cont_boost_05[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_boost_05[[1]]["perc_contradictions"]),
+  
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.7,
+         auc = eval_cont_boost_07$auc,
+         sensitivity = eval_cont_boost_07$sensitivity,
+         specificity = eval_cont_boost_07$specificity,
+         n_contradictions = cp_cont_boost_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_cont_boost_07[[1]]["perc_contradictions"]),
+  
+  # Binary age 50 - GLM
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.3,
+         auc = eval_bin50_glm_03$auc,
+         sensitivity = eval_bin50_glm_03$sensitivity,
+         specificity = eval_bin50_glm_03$specificity,
+         n_contradictions = cp_bin50_glm_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_glm_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.7,
+         auc = eval_bin50_glm_07$auc,
+         sensitivity = eval_bin50_glm_07$sensitivity,
+         specificity = eval_bin50_glm_07$specificity,
+         n_contradictions = cp_bin50_glm_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_glm_07[[1]]["perc_contradictions"]),
+  
+  # Binary age 50 - Bagging
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.3,
+         auc = eval_bin50_bag_03$auc,
+         sensitivity = eval_bin50_bag_03$sensitivity,
+         specificity = eval_bin50_bag_03$specificity,
+         n_contradictions = cp_bin50_bag_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_bag_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.5,
+         auc = eval_bin50_bag_05$auc,
+         sensitivity = eval_bin50_bag_05$sensitivity,
+         specificity = eval_bin50_bag_05$specificity,
+         n_contradictions = cp_bin50_bag_05[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_bag_05[[1]]["perc_contradictions"]),
+  
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.7,
+         auc = eval_bin50_bag_07$auc,
+         sensitivity = eval_bin50_bag_07$sensitivity,
+         specificity = eval_bin50_bag_07$specificity,
+         n_contradictions = cp_bin50_bag_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_bag_07[[1]]["perc_contradictions"]),
+  
+  # Binary age 50 - Boosting
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.3,
+         auc = eval_bin50_boost_03$auc,
+         sensitivity = eval_bin50_boost_03$sensitivity,
+         specificity = eval_bin50_boost_03$specificity,
+         n_contradictions = cp_bin50_boost_03[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_boost_03[[1]]["perc_contradictions"]),
+  
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.5,
+         auc = eval_bin50_boost_05$auc,
+         sensitivity = eval_bin50_boost_05$sensitivity,
+         specificity = eval_bin50_boost_05$specificity,
+         n_contradictions = cp_bin50_boost_05[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_boost_05[[1]]["perc_contradictions"]),
+  
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.7,
+         auc = eval_bin50_boost_07$auc,
+         sensitivity = eval_bin50_boost_07$sensitivity,
+         specificity = eval_bin50_boost_07$specificity,
+         n_contradictions = cp_bin50_boost_07[[1]]["n_contradictions"],
+         perc_contradictions = cp_bin50_boost_07[[1]]["perc_contradictions"])
+)
+
+results_table
+write_xlsx(results_table, "results_table.xlsx")
+```
+
+## Age characteristics
+
+```{r}
+age_analysis <- function(cp_object, test_df_with_gender) {
+  
+  indices <- cp_object[[3]]
+  
+  #Ages of people whose classification changes 
+  ages_change <- test_df_with_gender$agea[indices]
+  ages_no_change <- test_df_with_gender$agea[-indices]
+  
+  #Ages of people whose classification does not change
+  gender_change <- test_df_with_gender$gndr[indices]
+  gender_no_change <- test_df_with_gender$gndr[-indices]
+  
+  return(tibble(
+    n_change = length(ages_change),
+    mean_age_change = round(mean(ages_change), 1),
+    mean_age_no_change = round(mean(ages_no_change), 1),
+    age_difference = round(mean(ages_change) - mean(ages_no_change), 1),
+    pct_female_change = round(mean(gender_change == 2) * 100, 1)
+  ))
+}
+```
+
+```{r}
+age_cont_glm_03 <- age_analysis(cp_cont_glm_03, test_df_with_gender)
+age_cont_glm_05 <- age_analysis(cp_cont_glm_05, test_df_with_gender)
+age_cont_glm_07 <- age_analysis(cp_cont_glm_07, test_df_with_gender)
+
+age_cont_bag_03 <- age_analysis(cp_cont_bag_03, test_df_with_gender)
+age_cont_bag_05 <- age_analysis(cp_cont_bag_05, test_df_with_gender)
+age_cont_bag_07 <- age_analysis(cp_cont_bag_07, test_df_with_gender)
+
+age_cont_boost_03 <- age_analysis(cp_cont_boost_03, test_df_with_gender)
+age_cont_boost_05 <- age_analysis(cp_cont_boost_05, test_df_with_gender)
+age_cont_boost_07 <- age_analysis(cp_cont_boost_07, test_df_with_gender)
+
+age_bin50_glm_03 <- age_analysis(cp_bin50_glm_03, test_df_with_gender)
+age_bin50_glm_07 <- age_analysis(cp_bin50_glm_07, test_df_with_gender)
+
+age_bin50_bag_03 <- age_analysis(cp_bin50_bag_03, test_df_with_gender)
+age_bin50_bag_05 <- age_analysis(cp_bin50_bag_05, test_df_with_gender)
+age_bin50_bag_07 <- age_analysis(cp_bin50_bag_07, test_df_with_gender)
+
+age_bin50_boost_03 <- age_analysis(cp_bin50_boost_03, test_df_with_gender)
+age_bin50_boost_05 <- age_analysis(cp_bin50_boost_05, test_df_with_gender)
+age_bin50_boost_07 <- age_analysis(cp_bin50_boost_07, test_df_with_gender)
+
+```
+
+```{r}
+age_table <- rbind(
+  #Baseline
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.5,
+         n_change = 0, mean_age_change = NA, mean_age_no_change = NA, age_difference = NA,
+         pct_female_change = NA),
+  
+  #Continuous age - GLM
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.3,
+         n_change = age_cont_glm_03$n_change,
+         mean_age_change = age_cont_glm_03$mean_age_change,
+         mean_age_no_change = age_cont_glm_03$mean_age_no_change,
+         age_difference = age_cont_glm_03$age_difference,
+         pct_female_change = age_cont_glm_03$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.5,
+         n_change = age_cont_glm_05$n_change,
+         mean_age_change = age_cont_glm_05$mean_age_change,
+         mean_age_no_change = age_cont_glm_05$mean_age_no_change,
+         age_difference = age_cont_glm_05$age_difference,
+         pct_female_change = age_cont_glm_05$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "GLM", threshold = 0.7,
+         n_change = age_cont_glm_07$n_change,
+         mean_age_change = age_cont_glm_07$mean_age_change,
+         mean_age_no_change = age_cont_glm_07$mean_age_no_change,
+         age_difference = age_cont_glm_07$age_difference,
+         pct_female_change = age_cont_glm_07$pct_female_change),
+  
+  #Continuous age - Bagging
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.3,
+         n_change = age_cont_bag_03$n_change,
+         mean_age_change = age_cont_bag_03$mean_age_change,
+         mean_age_no_change = age_cont_bag_03$mean_age_no_change,
+         age_difference = age_cont_bag_03$age_difference,
+         pct_female_change= age_cont_bag_03$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.5,
+         n_change = age_cont_bag_05$n_change,
+         mean_age_change = age_cont_bag_05$mean_age_change,
+         mean_age_no_change = age_cont_bag_05$mean_age_no_change,
+         age_difference = age_cont_bag_05$age_difference,
+         pct_female_change = age_cont_bag_05$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "Bagging", threshold = 0.7,
+         n_change = age_cont_bag_07$n_change,
+         mean_age_change = age_cont_bag_07$mean_age_change,
+         mean_age_no_change = age_cont_bag_07$mean_age_no_change,
+         age_difference = age_cont_bag_07$age_difference,
+         pct_female_change = age_cont_bag_07$pct_female_change),
+  
+  #Continuous age - Boosting
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.3,
+         n_change = age_cont_boost_03$n_change,
+         mean_age_change = age_cont_boost_03$mean_age_change,
+         mean_age_no_change = age_cont_boost_03$mean_age_no_change,
+         age_difference = age_cont_boost_03$age_difference,
+         pct_female_change = age_cont_boost_03$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.5,
+         n_change = age_cont_boost_05$n_change,
+         mean_age_change = age_cont_boost_05$mean_age_change,
+         mean_age_no_change = age_cont_boost_05$mean_age_no_change,
+         age_difference = age_cont_boost_05$age_difference,
+         pct_female_change = age_cont_boost_05$pct_female_change),
+  
+  tibble(age = "continuous", algorithm = "Boosting", threshold = 0.7,
+         n_change = age_cont_boost_07$n_change,
+         mean_age_change = age_cont_boost_07$mean_age_change,
+         mean_age_no_change = age_cont_boost_07$mean_age_no_change,
+         age_difference = age_cont_boost_07$age_difference,
+         pct_female_change = age_cont_boost_07$pct_female_change),
+  
+  #Binary age 50 - GLM
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.3,
+         n_change = age_bin50_glm_03$n_change,
+         mean_age_change = age_bin50_glm_03$mean_age_change,
+         mean_age_no_change = age_bin50_glm_03$mean_age_no_change,
+         age_difference = age_bin50_glm_03$age_difference,
+         pct_female_change= age_bin50_glm_03$pct_female_change),
+  
+  tibble(age = "binary_50", algorithm = "GLM", threshold = 0.7,
+         n_change = age_bin50_glm_07$n_change,
+         mean_age_change = age_bin50_glm_07$mean_age_change,
+         mean_age_no_change = age_bin50_glm_07$mean_age_no_change,
+         age_difference = age_bin50_glm_07$age_difference,
+         pct_female_change = age_bin50_glm_07$pct_female_change),
+  
+  #Binary age 50 - Bagging
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.3,
+         n_change = age_bin50_bag_03$n_change,
+         mean_age_change = age_bin50_bag_03$mean_age_change,
+         mean_age_no_change = age_bin50_bag_03$mean_age_no_change,
+         age_difference = age_bin50_bag_03$age_difference,
+         pct_female_change = age_bin50_bag_03$pct_female_change),
+  
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.5,
+         n_change = age_bin50_bag_05$n_change,
+         mean_age_change = age_bin50_bag_05$mean_age_change,
+         mean_age_no_change = age_bin50_bag_05$mean_age_no_change,
+         age_difference = age_bin50_bag_05$age_difference,
+         pct_female_change = age_bin50_bag_05$pct_female_change),
+  
+  tibble(age = "binary_50", algorithm = "Bagging", threshold = 0.7,
+         n_change = age_bin50_bag_07$n_change,
+         mean_age_change = age_bin50_bag_07$mean_age_change,
+         mean_age_no_change = age_bin50_bag_07$mean_age_no_change,
+         age_difference = age_bin50_bag_07$age_difference,
+         pct_female_change= age_bin50_bag_07$pct_female_change),
+  
+  #Binary age 50 - Boosting
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.3,
+         n_change = age_bin50_boost_03$n_change,
+         mean_age_change = age_bin50_boost_03$mean_age_change,
+         mean_age_no_change = age_bin50_boost_03$mean_age_no_change,
+         age_difference = age_bin50_boost_03$age_difference,
+         pct_female_change = age_bin50_boost_03$pct_female_change),
+  
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.5,
+         n_change = age_bin50_boost_05$n_change,
+         mean_age_change = age_bin50_boost_05$mean_age_change,
+         mean_age_no_change = age_bin50_boost_05$mean_age_no_change,
+         age_difference = age_bin50_boost_05$age_difference,
+         pct_female_change = age_bin50_boost_05$pct_female_change),
+  
+  tibble(age = "binary_50", algorithm = "Boosting", threshold = 0.7,
+         n_change = age_bin50_boost_07$n_change,
+         mean_age_change = age_bin50_boost_07$mean_age_change,
+         mean_age_no_change = age_bin50_boost_07$mean_age_no_change,
+         age_difference = age_bin50_boost_07$age_difference,
+         pct_female_change = age_bin50_boost_07$pct_female_change)
+  )
+
+age_table
+write_xlsx(age_table, "age_table.xlsx")
+```
+
+## Visualization (age)
+
+```{r}
+
+age_table %>%
+  filter(n_change > 0) %>%
+  mutate(config = paste(recode(age, "binary_50" = "Binary", "continuous" = "Continuous"),
+                         algorithm, threshold, sep = " | "),
+         config = reorder(config, mean_age_change)) %>%
+  ggplot(aes(y = config)) +
+  geom_segment(aes(x = mean_age_no_change, xend = mean_age_change, yend = config),
+               color = "grey", linewidth = 0.8) +
+  geom_point(aes(x = mean_age_no_change, color = "No contradiction points"), size = 3) +
+  geom_point(aes(x = mean_age_change, color = "Contradiction points"), size = 3) +
+  scale_color_manual(values = c("Contradiction points" = "#4a3aa7",
+                                 "No contradiction points" = "#898781")) +
+  labs(x = "Mean age (years)", y = NULL, color = NULL) +
+  theme_minimal(base_size = 12, base_family = "Times New Roman") +
+theme(
+  panel.grid.minor = element_blank(),
+  legend.position = "top",
+  text = element_text(color = "black"),
+  axis.text = element_text(color = "black"),
+  axis.title = element_text(color = "black"),
+  legend.text = element_text(color = "black"),
+  legend.title = element_text(color = "black")
+)
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+
+ggsave("mean_age_cp_vs_no_cp.png", width = 8, height = 7, dpi = 300)
+```
+
+# Correlations between age and numeric variables 
+
+```{r}
+
+cont_vars <- c("yrspdwka", "netuse", "sclmeet", "sclact", 
+               "impdiff", "ipeqopt", "imprich", "ipfrule")
+
+cont_results <- lapply(cont_vars, function(var_name) {
+  test <- cor.test(ESS5.DE.final.rec$agea, 
+                    ESS5.DE.final.rec[[var_name]], 
+                    use = "pairwise.complete.obs")
+  tibble(
+    variable = var_name,
+    type = "continuous",
+    correlation = round(test$estimate, 3),
+    p_value = round(test$p.value, 4)
+  )
+}) %>% bind_rows()
+
+cont_results
+
+```
+
+```{r}
+
+binary_vars <- c("uemp3m", "atncrse", "jbspv", "dscrgrp",
+                  "dscrrce", "dscretn", "dscrgnd", "dscrage", "hlthhmp")
+
+binary_results <- lapply(binary_vars, function(var_name) {
+  var_numeric <- as.numeric(as.character(ESS5.DE.final.rec[[var_name]]))
+  test <- cor.test(ESS5.DE.final.rec$agea, 
+                    var_numeric, 
+                    use = "pairwise.complete.obs")
+  tibble(
+    variable = var_name,
+    type = "binary",
+    correlation = round(test$estimate, 3),
+    p_value = round(test$p.value, 4)
+  )
+}) %>% bind_rows()
+
+binary_results
+
+```
+
+```{r}
+comb <- bind_rows(cont_results, binary_results)
+write_xlsx(comb, "correlation_matrix.xlsx")
+```
+
+# Proportion of variance in age explained by multi categorical variables
+
+```{r}
+
+multi_vars <- c("edulvlb", "emplrel", "rsnlvem")
+
+multi_results <- lapply(multi_vars, function(var_name) {
+  test <- aov(ESS5.DE.final.rec$agea ~ ESS5.DE.final.rec[[var_name]])
+  summary_test <- summary(test)[[1]]
+  eta_result <- eta_squared(test)
+  
+  tibble(
+    variable = var_name,
+    type = "multi-category",
+    df1 = summary_test$Df[1],        # numerator df (between groups)
+    df2 = summary_test$Df[2],        # denominator df (residual/within groups)
+    f_statistic = round(summary_test$`F value`[1], 3),
+    p_value = round(summary_test$`Pr(>F)`[1], 4),
+    eta_squared = round(eta_result$Eta2[1], 3)
+  )
+}) %>% bind_rows()
+
+multi_results
+write_xlsx(multi_results, "multi_results.xlsx")
+
+```
+
+## Age coefficients 
+
+```{r}
+# For the continuous age operationalization
+glm_model_cont <- results_continuous$glm$model
+summary(glm_model_cont)
+
+# For the binary (age 50 cutoff) operationalization
+glm_model_bin50 <- results_age50$glm$model
+summary(glm_model_bin50)
+```
+
+# Assumption checking - Log Linearity 
+```{r}
+#### Linearity
+
+empirical_logit_by_value <- function(data, predictor, outcome = "stem") {
+  df <- data %>%
+    mutate(y = as.numeric(as.character(.data[[outcome]]))) %>%
+    group_by(.data[[predictor]]) %>%
+    summarise(
+      n = n(),
+      events = sum(y),
+      emp_logit = log((events + 0.5) / (n - events + 0.5))
+    )
+
+  ggplot(df, aes(x = .data[[predictor]], y = emp_logit)) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    labs(title = paste("Empirical logit:", predictor),
+         x = predictor, y = "Empirical log-odds of STEM classification") +
+    theme_minimal(base_size = 12)
+}
+
+empirical_logit_plot <- function(data, predictor, outcome = "stem", n_bins = 10) {
+  df <- data %>%
+    mutate(y = as.numeric(as.character(.data[[outcome]])),
+           bin = ntile(.data[[predictor]], n_bins)) %>%
+    group_by(bin) %>%
+    summarise(
+      x_mean = mean(.data[[predictor]], na.rm = TRUE),
+      n = n(),
+      events = sum(y),
+      emp_logit = log((events + 0.5) / (n - events + 0.5))
+    )
+
+  ggplot(df, aes(x = x_mean, y = emp_logit)) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    labs(title = paste("Empirical logit:", predictor),
+         x = predictor, y = "Empirical log-odds of STEM classification") +
+    theme_minimal(base_size = 12)
+}
+
+# Graph per predictor 
+p1 <- empirical_logit_by_value(train_df_balanced, "sclmeet")
+ggsave("logit_sclmeet.png", plot = p1, width = 6, height = 4, dpi = 300)
+
+p2 <- empirical_logit_by_value(train_df_balanced, "sclact")
+ggsave("logit_sclact.png", plot = p2, width = 6, height = 4, dpi = 300)
+
+p3 <- empirical_logit_by_value(train_df_balanced, "impdiff")
+ggsave("logit_impdiff.png", plot = p3, width = 6, height = 4, dpi = 300)
+
+p4 <- empirical_logit_by_value(train_df_balanced, "ipeqopt")
+ggsave("logit_ipeqopt.png", plot = p4, width = 6, height = 4, dpi = 300)
+
+p5 <- empirical_logit_by_value(train_df_balanced, "imprich")
+ggsave("logit_imprich.png", plot = p5, width = 6, height = 4, dpi = 300)
+
+p6 <- empirical_logit_by_value(train_df_balanced, "ipfrule")
+ggsave("logit_ipfrule.png", plot = p6, width = 6, height = 4, dpi = 300)
+
+p7 <- empirical_logit_by_value(train_df_balanced, "health")
+ggsave("logit_health.png", plot = p7, width = 6, height = 4, dpi = 300)
+
+p8 <- empirical_logit_by_value(train_df_balanced, "actvgrs")
+ggsave("logit_actvgrs.png", plot = p8, width = 6, height = 4, dpi = 300)
+
+p9 <- empirical_logit_by_value(train_df_balanced, "wmcpwrk")
+ggsave("logit_wmcpwrk.png", plot = p9, width = 6, height = 4, dpi = 300)
+
+p10 <- empirical_logit_by_value(train_df_balanced, "mnrgtjb")
+ggsave("logit_mnrgtjb.png", plot = p10, width = 6, height = 4, dpi = 300)
+
+p11 <- empirical_logit_by_value(train_df_balanced, "netuse")
+ggsave("logit_netuse.png", plot = p11, width = 6, height = 4, dpi = 300) 
+
+p12 <- empirical_logit_plot(train_df_balanced, "yrspdwka")
+ggsave("logit_yrspdwka.png", plot = p12, width = 6, height = 4, dpi = 300)
+
+p13 <- empirical_logit_plot(train_df_balanced, "agea")
+ggsave("logit_agea.png", plot = p13, width = 6, height = 4, dpi = 300)
+
+```
